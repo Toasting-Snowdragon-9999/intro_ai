@@ -3,6 +3,7 @@ import random
 import argparse
 import sys
 import time
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -274,8 +275,7 @@ def n_step_sarsa(
     return Q_table, all_steps
 
 
-def q_visualizer(world: World, q: np.ndarray, title: Optional[str] = None) -> np.ndarray:
-    new_q = np.full((world.width, world.height), "", dtype=object)
+def _action_symbols() -> Dict[str, str]:
     encoding = sys.stdout.encoding or ""
     unicode_ok = True
     try:
@@ -283,35 +283,107 @@ def q_visualizer(world: World, q: np.ndarray, title: Optional[str] = None) -> np
     except UnicodeEncodeError:
         unicode_ok = False
 
-    action_symbols = (
+    return (
         {"up": "↑", "down": "↓", "left": "←", "right": "→"}
         if unicode_ok
         else {"up": "^", "down": "v", "left": "<", "right": ">"}
     )
+
+
+def best_action_indices(q_state: np.ndarray, tie_tol: float) -> List[int]:
+    max_q = float(np.max(q_state))
+    return [idx for idx, val in enumerate(q_state) if abs(float(val) - max_q) <= tie_tol]
+
+
+def policy_from_q(world: World, q: np.ndarray, tie_tol: float = 1e-6) -> np.ndarray:
+    policy = np.full((world.width, world.height), "", dtype=object)
+    action_symbols = _action_symbols()
+    tie_marker = "*"
+
     for x in range(world.width):
         for y in range(world.height):
             if isinstance(world, CliffWorld) and world.is_cliff(x, y):
-                new_q[x, y] = "C"
+                policy[x, y] = "C"
             elif world.is_terminal(x, y):
-                new_q[x, y] = "+"
+                policy[x, y] = "+"
             elif world.is_obstacle(x, y):
-                new_q[x, y] = "#"
+                policy[x, y] = "#"
             else:
-                new_q[x, y] = action_symbols[ACTIONS[int(np.argmax(q[x, y, :]))]]
+                best_idxs = best_action_indices(q[x, y, :], tie_tol=tie_tol)
+                if len(best_idxs) == 1:
+                    policy[x, y] = action_symbols[ACTIONS[best_idxs[0]]]
+                else:
+                    policy[x, y] = tie_marker
+    return policy
 
+
+def majority_policy_from_q_runs(world: World, q_runs: np.ndarray, tie_tol: float = 1e-6) -> np.ndarray:
+    if q_runs.ndim != 4:
+        raise ValueError(f"Expected q_runs with shape (runs, width, height, actions), got {q_runs.shape}")
+    if q_runs.shape[0] == 0:
+        raise ValueError("q_runs must contain at least one run")
+
+    per_run_policies = [policy_from_q(world, q_runs[i], tie_tol=tie_tol) for i in range(q_runs.shape[0])]
+    aggregated = np.full((world.width, world.height), "", dtype=object)
+    tie_marker = "*"
+
+    for x in range(world.width):
+        for y in range(world.height):
+            if isinstance(world, CliffWorld) and world.is_cliff(x, y):
+                aggregated[x, y] = "C"
+                continue
+            if world.is_terminal(x, y):
+                aggregated[x, y] = "+"
+                continue
+            if world.is_obstacle(x, y):
+                aggregated[x, y] = "#"
+                continue
+
+            votes = Counter(str(policy[x, y]) for policy in per_run_policies)
+            top_count = max(votes.values())
+            winners = [symbol for symbol, count in votes.items() if count == top_count]
+            aggregated[x, y] = winners[0] if len(winners) == 1 else tie_marker
+
+    return aggregated
+
+
+def print_policy_legend() -> None:
+    action_symbols = _action_symbols()
+    print(
+        "Legend: "
+        f"{action_symbols['up']}=up {action_symbols['down']}=down "
+        f"{action_symbols['left']}=left {action_symbols['right']}=right "
+        "C=cliff +=goal *=tie"
+    )
+
+
+def q_visualizer_policy(world: World, policy_map: np.ndarray, title: Optional[str] = None) -> np.ndarray:
     if title is None:
         title = "Best action at each state (arrows show direction):"
     print(title)
 
-    # table = np.flipud(new_q.T)
-    table = new_q.T
+    table = policy_map.T
     x_header = "     " + " ".join(f"{x:>2}" for x in range(world.width))
     print(x_header)
     for row_idx, row in enumerate(table):
         display_row = world.height - row_idx
         print(f"row={display_row:>2} | " + " ".join(f"{str(cell):>2}" for cell in row))
 
-    return new_q
+    return policy_map
+
+
+def q_visualizer(
+    world: World,
+    q: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+    policy_map: Optional[np.ndarray] = None,
+    tie_tol: float = 1e-6,
+) -> np.ndarray:
+    if policy_map is None:
+        if q is None:
+            raise ValueError("Either q or policy_map must be provided to q_visualizer")
+        policy_map = policy_from_q(world, q, tie_tol=tie_tol)
+    return q_visualizer_policy(world, policy_map, title=title)
 
 
 def run_validation_checks(results: Dict[str, object], episodes: int) -> None:
@@ -327,8 +399,18 @@ def run_validation_checks(results: Dict[str, object], episodes: int) -> None:
     assert done is True, "Goal state should terminate the episode"
     assert reward == -1.0, "Goal step reward should be -1"
 
+    # Unique max action selects exactly one action index.
+    assert best_action_indices(np.array([0.0, 1.0, -2.0, 0.5]), tie_tol=1e-6) == [1]
+    # Near-equal best actions are treated as ties within tolerance.
+    assert best_action_indices(np.array([1.0, 1.0 + 5e-7, 0.0, -1.0]), tie_tol=1e-6) == [0, 1]
+    # Cliff/goal encoding must override action glyphs in policy visualization.
+    test_q = np.zeros((env.width, env.height, len(ACTIONS)))
+    policy_map = policy_from_q(env, test_q, tie_tol=1e-6)
+    assert policy_map[1, 0] == "C", "Cliff cells must render as C"
+    assert policy_map[env.goal_state[0], env.goal_state[1]] == "+", "Goal must render as +"
+
     mean_returns_by_n = results["mean_returns_by_n"]
-    assert set(mean_returns_by_n.keys()) == {1, 2, 3, 4}, "Sweep must contain n={1,2,3,4}"
+    assert set(mean_returns_by_n.keys()) == {1, 2, 3, 4, 10}, "Sweep must contain n={1,2,3,4}"
 
     for n, curve in mean_returns_by_n.items():
         assert curve.shape == (episodes,), f"Mean return curve for n={n} has wrong shape"
@@ -363,6 +445,8 @@ def run_cliff_nstep_experiment(
     seed_base: int = 123,
     out_path: str = "sarsa/artifacts/cliff_nstep_returns.png",
     visualize_policy: bool = True,
+    policy_source: str = "eval_greedy",
+    tie_tol: float = 1e-6,
     debug: bool = False,
 ) -> Dict[str, object]:
     import matplotlib
@@ -371,8 +455,13 @@ def run_cliff_nstep_experiment(
     import matplotlib.pyplot as plt
 
     n_values = list(n_values)
+    valid_policy_sources = {"eval_greedy", "single_run", "mean_q"}
+    if policy_source not in valid_policy_sources:
+        raise ValueError(f"policy_source must be one of {sorted(valid_policy_sources)}, got {policy_source!r}")
+
     mean_returns_by_n: Dict[int, np.ndarray] = {}
     mean_q_by_n: Dict[int, np.ndarray] = {}
+    q_runs_by_n: Dict[int, np.ndarray] = {}
 
     _debug_print(
         debug,
@@ -421,7 +510,9 @@ def run_cliff_nstep_experiment(
             )
 
         mean_returns_by_n[n] = np.mean(np.vstack(run_returns), axis=0)
-        mean_q_by_n[n] = np.mean(np.stack(run_q, axis=0), axis=0)
+        q_runs = np.stack(run_q, axis=0)
+        q_runs_by_n[n] = q_runs
+        mean_q_by_n[n] = np.mean(q_runs, axis=0)
         _debug_print(debug, f"[experiment] aggregated n={n} in {time.perf_counter() - n_start:.2f}s")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -435,7 +526,7 @@ def run_cliff_nstep_experiment(
         plt.plot(avg, label=f"n={n}")
     plt.xlabel("Episode")
     plt.ylabel("Average Return")
-    plt.title("n-step SARSA (averaged over 1000 runs)")
+    plt.title(f"n-step SARSA (averaged over {runs_per_n} runs)")
     plt.ylim(-300, 0)
     plt.legend(loc="lower right")
     plt.grid(alpha=0.3)
@@ -454,10 +545,15 @@ def run_cliff_nstep_experiment(
     print(f"Best n (final-{window} mean): n={best_n}")
     print(f"Saved plot: {out_path}")
     if visualize_policy:
-        q_visualizer(world, mean_q_by_n[1], title=f"Best policy for n={1}:")
-        q_visualizer(world, mean_q_by_n[2], title=f"Best policy for n={2}:")
-        q_visualizer(world, mean_q_by_n[3], title=f"Best policy for n={3}:")
-        q_visualizer(world, mean_q_by_n[4], title=f"Best policy for n={4}:")
+        print_policy_legend()
+        for n in n_values:
+            if policy_source == "eval_greedy":
+                policy_map = majority_policy_from_q_runs(world, q_runs_by_n[n], tie_tol=tie_tol)
+            elif policy_source == "single_run":
+                policy_map = policy_from_q(world, q_runs_by_n[n][-1], tie_tol=tie_tol)
+            else:
+                policy_map = policy_from_q(world, mean_q_by_n[n], tie_tol=tie_tol)
+            q_visualizer_policy(world, policy_map, title=f"Best policy for n={n} ({policy_source}):")
 
     _debug_print(debug, f"[experiment] completed in {time.perf_counter() - experiment_start:.2f}s")
 
@@ -471,8 +567,8 @@ def run_cliff_nstep_experiment(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Cliff World n-step SARSA experiment and visualize learned policy.")
-    parser.add_argument("--episodes", type=int, default=500, help="Episodes per run (default: 500)")
-    parser.add_argument("--runs", type=int, default=1000, help="Number of runs averaged per n (default: 1000)")
+    parser.add_argument("--episodes", type=int, default=10000, help="Episodes per run (default: 500)")
+    parser.add_argument("--runs", type=int, default=10, help="Number of runs averaged per n (default: 1000)")
     parser.add_argument("--alpha", type=float, default=0.5, help="Learning rate alpha (default: 0.5)")
     parser.add_argument("--epsilon", type=float, default=0.1, help="Epsilon-greedy exploration rate (default: 0.1)")
     parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor gamma (default: 1.0)")
@@ -494,13 +590,25 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable detailed debug tracing for runs, episodes, and step heartbeats.",
     )
+    parser.add_argument(
+        "--policy-source",
+        choices=("eval_greedy", "single_run", "mean_q"),
+        default="eval_greedy",
+        help="Policy visualization source (default: eval_greedy).",
+    )
+    parser.add_argument(
+        "--tie-tol",
+        type=float,
+        default=1e-6,
+        help="Tolerance for marking near-equal best actions as ties (default: 1e-6).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     results = run_cliff_nstep_experiment(
-        n_values=(1, 2, 3, 4),
+        n_values=(1, 2, 3, 4, 10),
         episodes=args.episodes,
         runs_per_n=args.runs,
         alpha=args.alpha,
@@ -510,6 +618,8 @@ if __name__ == "__main__":
         seed_base=args.seed_base,
         out_path=args.out,
         visualize_policy=not args.no_visualizer,
+        policy_source=args.policy_source,
+        tie_tol=args.tie_tol,
         debug=args.debug,
     )
     run_validation_checks(results, episodes=args.episodes)

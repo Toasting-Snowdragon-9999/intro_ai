@@ -28,6 +28,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable terminal policy visualization.",
     )
+    parser.add_argument(
+        "--policy-source",
+        choices=("eval_greedy", "single_run", "mean_q"),
+        default="eval_greedy",
+        help="Policy visualization source (default: eval_greedy).",
+    )
+    parser.add_argument(
+        "--tie-tol",
+        type=float,
+        default=1e-6,
+        help="Tolerance for marking near-equal best actions as ties (default: 1e-6).",
+    )
     return parser.parse_args()
 
 
@@ -45,6 +57,8 @@ def main() -> None:
         seed_base=args.seed_base,
         out_path=args.out,
         visualize_policy=not args.no_visualizer,
+        policy_source=args.policy_source,
+        tie_tol=args.tie_tol,
         debug=args.debug,
     )
     
